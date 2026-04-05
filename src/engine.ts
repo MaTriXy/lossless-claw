@@ -1018,7 +1018,7 @@ function readFileSegment(sessionFile: string, offset: number): string | null {
   }
 }
 
-function readLastJsonlEntryBeforeOffset(sessionFile: string, offset: number): string | null {
+function readLastJsonlEntryBeforeOffset(sessionFile: string, offset: number, messageOnly = false): string | null {
   const chunkSize = 16_384;
   let fd: number | null = null;
   try {
@@ -1030,16 +1030,23 @@ function readLastJsonlEntryBeforeOffset(sessionFile: string, offset: number): st
     fd = openSync(sessionFile, "r");
     let cursor = safeOffset;
     let carry = "";
-    while (cursor > 0) {
-      const start = Math.max(0, cursor - chunkSize);
-      const length = cursor - start;
-      const buffer = Buffer.alloc(length);
-      readSync(fd, buffer, 0, length, start);
-      carry = buffer.toString("utf8") + carry;
+    let reachedStart = false;
+    while (cursor > 0 || (reachedStart && carry.length > 0)) {
+      if (!reachedStart) {
+        const start = Math.max(0, cursor - chunkSize);
+        const length = cursor - start;
+        const buffer = Buffer.alloc(length);
+        readSync(fd, buffer, 0, length, start);
+        carry = buffer.toString("utf8") + carry;
+        cursor = start;
+        if (start === 0) {
+          reachedStart = true;
+        }
+      }
 
       const trimmedEnd = carry.replace(/\s+$/u, "");
       if (!trimmedEnd) {
-        cursor = start;
+        if (reachedStart) break;
         carry = "";
         continue;
       }
@@ -1048,17 +1055,36 @@ function readLastJsonlEntryBeforeOffset(sessionFile: string, offset: number): st
       if (newlineIndex >= 0) {
         const candidate = trimmedEnd.slice(newlineIndex + 1).trim();
         if (candidate) {
+          if (messageOnly) {
+            let isMessage = false;
+            try {
+              isMessage = extractBootstrapMessageCandidate(JSON.parse(candidate)) != null;
+            } catch { /* not valid JSON, skip */ }
+            if (!isMessage) {
+              carry = trimmedEnd.slice(0, newlineIndex);
+              continue;
+            }
+          }
           return candidate;
         }
         carry = trimmedEnd.slice(0, newlineIndex);
-        cursor = start;
         continue;
       }
 
-      if (start === 0) {
-        return trimmedEnd.trim() || null;
+      // No newline found — entire trimmedEnd is one line
+      if (reachedStart) {
+        const firstLine = trimmedEnd.trim() || null;
+        if (firstLine && messageOnly) {
+          let isMessage = false;
+          try {
+            isMessage = extractBootstrapMessageCandidate(JSON.parse(firstLine)) != null;
+          } catch { /* not valid JSON */ }
+          if (!isMessage) return null;
+        }
+        return firstLine;
       }
-      cursor = start;
+      // Need more data from earlier in the file
+      continue;
     }
     return null;
   } catch {
@@ -1827,17 +1853,18 @@ export class LcmContextEngine implements ContextEngine {
     conversationId: number;
     historicalMessages: AgentMessage[];
   }): Promise<{
+    blockedByImportCap: boolean;
     importedMessages: number;
     hasOverlap: boolean;
   }> {
     const { sessionId, conversationId, historicalMessages } = params;
     if (historicalMessages.length === 0) {
-      return { importedMessages: 0, hasOverlap: false };
+      return { blockedByImportCap: false, importedMessages: 0, hasOverlap: false };
     }
 
     const latestDbMessage = await this.conversationStore.getLastMessage(conversationId);
     if (!latestDbMessage) {
-      return { importedMessages: 0, hasOverlap: false };
+      return { blockedByImportCap: false, importedMessages: 0, hasOverlap: false };
     }
 
     const storedHistoricalMessages = historicalMessages.map((message) => toStoredMessage(message));
@@ -1858,7 +1885,7 @@ export class LcmContextEngine implements ContextEngine {
         }
       }
       if (dbOccurrences === historicalOccurrences) {
-        return { importedMessages: 0, hasOverlap: true };
+        return { blockedByImportCap: false, importedMessages: 0, hasOverlap: true };
       }
     }
 
@@ -1910,13 +1937,20 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     if (anchorIndex < 0) {
-      return { importedMessages: 0, hasOverlap: false };
+      return { blockedByImportCap: false, importedMessages: 0, hasOverlap: false };
     }
     if (anchorIndex >= historicalMessages.length - 1) {
-      return { importedMessages: 0, hasOverlap: true };
+      return { blockedByImportCap: false, importedMessages: 0, hasOverlap: true };
     }
 
     const missingTail = historicalMessages.slice(anchorIndex + 1);
+
+    const existingDbCount = await this.conversationStore.getMessageCount(conversationId);
+    if (existingDbCount > 0 && missingTail.length > Math.max(existingDbCount * 0.2, 50)) {
+      console.error(`[lcm] reconcileSessionTail: import cap exceeded — would import ${missingTail.length} messages (existing: ${existingDbCount}). Aborting to prevent flood.`);
+      return { blockedByImportCap: true, importedMessages: 0, hasOverlap: true };
+    }
+
     let importedMessages = 0;
     for (const message of missingTail) {
       const result = await this.ingestSingle({ sessionId, sessionKey: params.sessionKey, message });
@@ -1925,7 +1959,7 @@ export class LcmContextEngine implements ContextEngine {
       }
     }
 
-    return { importedMessages, hasOverlap: true };
+    return { blockedByImportCap: false, importedMessages, hasOverlap: true };
   }
 
   async bootstrap(params: {
@@ -2020,6 +2054,7 @@ export class LcmContextEngine implements ContextEngine {
             const tailEntryRaw = readLastJsonlEntryBeforeOffset(
               params.sessionFile,
               bootstrapState.lastProcessedOffset,
+              true,
             );
             const tailEntryMessage = readBootstrapMessageFromJsonLine(tailEntryRaw);
             const tailEntryHash = tailEntryMessage
@@ -2143,6 +2178,14 @@ export class LcmContextEngine implements ContextEngine {
             conversationId,
             historicalMessages,
           });
+
+          if (reconcile.blockedByImportCap) {
+            return {
+              bootstrapped: false,
+              importedMessages: 0,
+              reason: "reconcile import capped",
+            };
+          }
 
           if (!conversation.bootstrappedAt) {
             await this.conversationStore.markConversationBootstrapped(conversationId);
@@ -2406,9 +2449,34 @@ export class LcmContextEngine implements ContextEngine {
           };
         }
 
-        return params.runtimeContext.rewriteTranscriptEntries({
+        const result = await params.runtimeContext.rewriteTranscriptEntries({
           replacements,
         });
+
+        if (result.changed) {
+          try {
+            const fileStat = statSync(params.sessionFile);
+            const newSize = fileStat.size;
+            const newMtimeMs = Math.trunc(fileStat.mtimeMs);
+            const lastEntryRaw = readLastJsonlEntryBeforeOffset(params.sessionFile, newSize, true);
+            const lastEntryMsg = readBootstrapMessageFromJsonLine(lastEntryRaw);
+            const lastEntryHash = lastEntryMsg ? createBootstrapEntryHash(toStoredMessage(lastEntryMsg)) : null;
+            if (lastEntryHash) {
+              await this.summaryStore.upsertConversationBootstrapState({
+                conversationId: conversation.conversationId,
+                sessionFilePath: params.sessionFile,
+                lastSeenSize: newSize,
+                lastSeenMtimeMs: newMtimeMs,
+                lastProcessedOffset: newSize,
+                lastProcessedEntryHash: lastEntryHash,
+              });
+            }
+          } catch (e) {
+            console.error("[lcm] Failed to update bootstrap checkpoint after maintain:", e);
+          }
+        }
+
+        return result;
       },
     );
   }
@@ -3516,3 +3584,6 @@ function createEmergencyFallbackSummarize(): (
     return text.slice(0, maxChars) + "\n[Truncated for context management]";
   };
 }
+
+/** @internal Exposed for unit tests only. */
+export const __testing = { readLastJsonlEntryBeforeOffset };
