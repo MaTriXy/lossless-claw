@@ -3093,7 +3093,7 @@ export class LcmContextEngine implements ContextEngine {
         // overflow counts can drive recovery even when persisted context is already small.
         const useSweep = manualCompactionRequested || params.compactionTarget === "threshold";
         if (useSweep) {
-          const sweepResult = await this.compaction.compactFullSweep({
+          const sweepResult = await this.compaction.compact({
             conversationId,
             tokenBudget,
             summarize,
